@@ -1,10 +1,9 @@
-# Rust / Tauri
-/src-tauri/target/
-/src-tauri/Cargo.lock
-.taurirc*
-tauri.conf.json.*.backup
+# Electron
+dist-electron/
+out/
+release/
 
-# React / Node
+# React / Vite
 node_modules/
 dist/
 build/
@@ -43,6 +42,12 @@ logs/
 *.db-wal
 *.db-shm
 /data/
+
+# Test
+test-results/
+playwright-report/
+/test/screenshots/*.png
+!/test/screenshots/e2e.png
 
 # Temp files
 *.tmp
