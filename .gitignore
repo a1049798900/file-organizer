@@ -42,6 +42,7 @@ logs/
 *.db-wal
 *.db-shm
 /data/
+.localdb/
 
 # Test
 test-results/
