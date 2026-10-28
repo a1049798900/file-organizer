@@ -11,6 +11,11 @@ const external = Object.keys(
   'dependencies' in pkg ? (pkg.dependencies as Record<string, string>) : {},
 )
 
+const alias = {
+  '@': path.join(__dirname, 'src'),
+  '@shared': path.join(__dirname, 'src/shared'),
+}
+
 // https://vitejs.dev/config/
 export default defineConfig(({ command }) => {
   rmSync('dist-electron', { recursive: true, force: true })
@@ -21,9 +26,7 @@ export default defineConfig(({ command }) => {
 
   return {
     resolve: {
-      alias: {
-        '@': path.join(__dirname, 'src'),
-      },
+      alias,
     },
     plugins: [
       react(),
@@ -33,6 +36,10 @@ export default defineConfig(({ command }) => {
           input: 'electron/main/index.ts',
           plugins: [notBundle()],
           options: {
+            resolve: {
+              // @ts-expect-error Vite 8 的环境解析类型未声明 alias，但运行时仍支持
+              alias,
+            },
             build: {
               sourcemap,
               minify: isBuild,
@@ -47,6 +54,10 @@ export default defineConfig(({ command }) => {
           input: 'electron/preload/index.ts',
           plugins: [notBundle()],
           options: {
+            resolve: {
+              // @ts-expect-error Vite 8 的环境解析类型未声明 alias，但运行时仍支持
+              alias,
+            },
             build: {
               sourcemap: sourcemap ? 'inline' : undefined, // #332
               minify: isBuild,

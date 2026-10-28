@@ -1,6 +1,6 @@
 // weave-asset:// 自定义协议
 // 用于预览时安全加载本地文件，不暴露真实路径
-import { protocol, type ProtocolRequest } from 'electron';
+import { protocol } from 'electron';
 import fs from 'node:fs/promises';
 import { getFile } from '../services/fileSvc';
 
@@ -49,11 +49,14 @@ function mimeOf(ext: string): string {
 }
 
 export function registerAssetProtocol(): void {
-  protocol.handle('weave-asset', async (request: ProtocolRequest) => {
+  protocol.handle('weave-asset', async (request) => {
     try {
       const url = new URL(request.url);
-      // 路径格式：weave-asset://file/<id>
-      const match = url.pathname.match(/^\/file\/(\d+)/);
+      // 支持两种写法：weave-asset://file/<id> 与 weave-asset://<host>/file/<id>
+      // 自定义协议为 standard scheme 时，file 会被解析为 hostname
+      const match =
+        url.pathname.match(/^\/file\/(\d+)/) ??
+        (url.hostname === 'file' ? url.pathname.match(/^\/(\d+)$/) : null);
       if (!match) {
         return new Response('invalid path', { status: 400 });
       }

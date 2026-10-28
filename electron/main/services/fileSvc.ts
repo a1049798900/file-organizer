@@ -1,17 +1,36 @@
 // 文件服务 — M2/M5/M8
+import type Database from 'better-sqlite3';
 import { getDb } from '../db';
-import { getTagsForFiles } from './tagSvc';
-import type { FileRow, FileListSource, FileSort, BatchResult } from '@shared/types';
+import { getTagsForFiles, getTagsForFilesFrom } from './tagSvc';
+import type {
+  FileRow,
+  FileListSource,
+  FileSort,
+  BatchResult,
+  FileAssociations,
+  MoveTargetInfo,
+} from '@shared/types';
 import fs from 'node:fs';
-import { shell } from 'electron';
+import path from 'node:path';
+import { BrowserWindow, dialog, shell } from 'electron';
+import { getNamePinyin } from '../util/pinyin';
+
+type Db = Database.Database;
 
 /**
  * 构建文件列表查询
  * 统一入口：所有文件列表（收件箱、项目、知识库、搜索）都通过此函数获取
  */
 export function listFiles(source: FileListSource, sort: FileSort): FileRow[] {
-  const db = getDb();
+  return listFilesFrom(getDb(), source, sort);
+}
 
+/** 可注入 db 的实现，便于单元测试 */
+export function listFilesFrom(
+  db: Db,
+  source: FileListSource,
+  sort: FileSort,
+): FileRow[] {
   let sql = `
     SELECT DISTINCT f.id, f.name, f.alias, f.path, f.size, f.ext, f.mtime,
            f.status, f.in_knowledge, f.created_at
@@ -22,6 +41,8 @@ export function listFiles(source: FileListSource, sort: FileSort): FileRow[] {
   switch (source.kind) {
     case 'inbox':
       sql += `WHERE f.status = 'inbox' `;
+      break;
+    case 'all':
       break;
     case 'project':
       sql += `
@@ -57,7 +78,7 @@ export function listFiles(source: FileListSource, sort: FileSort): FileRow[] {
       // 搜索使用自己的排序权重
       sql += `ORDER BY s.rank ASC, ${sortColumn(searchSort)} ${searchSort.dir === 'desc' ? 'DESC' : 'ASC'} `;
       const rows = db.prepare(sql).all(...params) as Omit<FileRow, 'tags' | 'pathMissing'>[];
-      return enrichFileRows(rows);
+      return enrichFileRows(db, rows);
     }
   }
 
@@ -65,7 +86,7 @@ export function listFiles(source: FileListSource, sort: FileSort): FileRow[] {
   sql += `ORDER BY ${sortColumn(sort)} ${sort.dir === 'desc' ? 'DESC' : 'ASC'} `;
 
   const rows = db.prepare(sql).all(...params) as Omit<FileRow, 'tags' | 'pathMissing'>[];
-  return enrichFileRows(rows);
+  return enrichFileRows(db, rows);
 }
 
 function sortColumn(sort: FileSort): string {
@@ -76,14 +97,20 @@ function sortColumn(sort: FileSort): string {
       return 'f.ext COLLATE NOCASE';
     case 'size':
       return 'f.size';
-    case 'mtime':
+    case 'tags':
+      // 按首个标签名排序（无标签的文件排在最后/最前由方向决定）
+      return `(SELECT GROUP_CONCAT(t.name, '、') FROM tag_links tl JOIN tags t ON t.id = tl.tag_id WHERE tl.file_id = f.id) COLLATE NOCASE`;
+    default:
       return 'f.mtime';
   }
 }
 
 /**
- * 构建搜索查询 — 使用 FTS5 + 子串匹配
- * 排序权重：文件名前缀 > 文件名内部子串 > 标签 > 别名
+ * 构建搜索查询 — 使用 LIKE 子串匹配
+ * 排序权重：文件名前缀 > 拼音前缀 > 文件名包含 > 拼音包含 > 别名 > 标签
+ *
+ * 历史说明：曾使用 FTS5 unicode61 + "term"* 前缀匹配，但 unicode61 不切分中文，
+ * 整段中文文件名是一个 token，导致「博白」这类中间子串永远无法命中，故改为 LIKE。
  */
 function buildSearchQuery(query: string): {
   searchSql: string;
@@ -91,41 +118,53 @@ function buildSearchQuery(query: string): {
   sort: FileSort;
 } {
   const q = query.trim().toLowerCase();
+  const terms = q.split(/\s+/).filter(Boolean);
 
-  // FTS5 查询：前缀匹配
-  // 按空格分词，每个词加前缀匹配 *
-  const ftsTerms = q
-    .split(/\s+/)
-    .filter(Boolean)
-    .map((t) => `"${t.replace(/"/g, '""')}"*`)
-    .join(' ');
+  // LIKE 通配符转义，防止用户输入 % 或 _ 被当作通配符
+  const esc = (s: string) => s.replace(/[\\%_]/g, (c) => `\\${c}`);
+
+  // 多词查询：每个词都必须在 文件名/别名/拼音首字母 中子串命中（AND 语义）
+  const fileMatchCond = (alias: string) =>
+    terms
+      .map(
+        () =>
+          `(LOWER(${alias}.name) LIKE ? ESCAPE '\\' OR LOWER(IFNULL(${alias}.alias, '')) LIKE ? ESCAPE '\\' OR ${alias}.pinyin LIKE ? ESCAPE '\\')`,
+      )
+      .join(' AND ');
 
   const searchSql = `
     SELECT
-      files_fts.rowid,
+      f.id AS rowid,
       CASE
-        WHEN files_fts.name LIKE ? THEN 1
-        WHEN files_fts.pinyin LIKE ? THEN 1.5
-        WHEN files_fts.name LIKE ? THEN 2
-        WHEN files_fts.pinyin LIKE ? THEN 2.5
-        WHEN files_fts.alias LIKE ? THEN 4
+        WHEN LOWER(f.name) LIKE ? ESCAPE '\\' THEN 1
+        WHEN f.pinyin LIKE ? ESCAPE '\\' THEN 1.5
+        WHEN LOWER(f.name) LIKE ? ESCAPE '\\' THEN 2
+        WHEN f.pinyin LIKE ? ESCAPE '\\' THEN 2.5
+        WHEN LOWER(IFNULL(f.alias, '')) LIKE ? ESCAPE '\\' THEN 4
         ELSE 3
-      END as rank
-    FROM files_fts
-    WHERE files_fts MATCH ?
+      END AS rank
+    FROM files f
+    WHERE ${fileMatchCond('f')}
     UNION
     SELECT
-      f.id as rowid,
-      5 as rank
-    FROM files f
-    JOIN tag_links tl ON tl.file_id = f.id
+      tf.id AS rowid,
+      5 AS rank
+    FROM files tf
+    JOIN tag_links tl ON tl.file_id = tf.id
     JOIN tags t ON t.id = tl.tag_id
-    WHERE LOWER(t.name) LIKE ?
-    AND f.id NOT IN (SELECT rowid FROM files_fts WHERE files_fts MATCH ?)
+    WHERE LOWER(t.name) LIKE ? ESCAPE '\\'
+      AND tf.id NOT IN (
+        SELECT f2.id FROM files f2 WHERE ${fileMatchCond('f2')}
+      )
   `;
 
-  const prefixPattern = `${q}%`;
-  const containsPattern = `%${q}%`;
+  const prefixPattern = `${esc(q)}%`;
+  const containsPattern = `%${esc(q)}%`;
+
+  const termParams = terms.flatMap((t) => {
+    const p = `%${esc(t)}%`;
+    return [p, p, p];
+  });
 
   const searchParams = [
     prefixPattern,   // name prefix
@@ -133,9 +172,9 @@ function buildSearchQuery(query: string): {
     containsPattern, // name contains
     containsPattern, // pinyin contains
     containsPattern, // alias contains
-    ftsTerms,        // FTS5 match
+    ...termParams,   // 主查询 WHERE
     containsPattern, // tag name contains
-    ftsTerms,        // FTS5 match for exclusion
+    ...termParams,   // 排除子查询 WHERE
   ];
 
   return {
@@ -148,11 +187,11 @@ function buildSearchQuery(query: string): {
 /**
  * 为文件行补充 tags 和 pathMissing
  */
-function enrichFileRows(rows: Omit<FileRow, 'tags' | 'pathMissing'>[]): FileRow[] {
+function enrichFileRows(db: Db, rows: Omit<FileRow, 'tags' | 'pathMissing'>[]): FileRow[] {
   if (rows.length === 0) return [];
 
   const ids = rows.map((r) => r.id);
-  const tagsMap = getTagsForFiles(ids);
+  const tagsMap = getTagsForFilesFrom(db, ids);
 
   return rows.map((row) => ({
     ...row,
@@ -224,16 +263,70 @@ export function markFiled(ids: number[]): void {
 }
 
 /**
+ * 将外部拖入的文件加入索引（直接进入收件箱）
+ * 已在索引中的文件会更新大小/时间并重新置为 inbox
+ */
+export function indexPaths(paths: string[]): BatchResult {
+  const uniquePaths = Array.from(
+    new Set(paths.filter((p) => typeof p === 'string' && p.trim().length > 0)),
+  );
+  if (uniquePaths.length === 0) return { ok: 0, fail: 0 };
+
+  const db = getDb();
+  const insert = db.prepare(`
+    INSERT INTO files (name, alias, path, size, ext, mtime, status, in_knowledge, pinyin, created_at)
+    VALUES (?, NULL, ?, ?, ?, ?, 'inbox', 0, ?, ?)
+    ON CONFLICT(path) DO UPDATE SET
+      size = excluded.size,
+      mtime = excluded.mtime,
+      status = 'inbox'
+  `);
+
+  const now = Date.now();
+  let ok = 0;
+  let fail = 0;
+
+  const transaction = db.transaction(() => {
+    for (const filePath of uniquePaths) {
+      try {
+        const stats = fs.statSync(filePath);
+        if (!stats.isFile()) {
+          fail++;
+          continue;
+        }
+        const name = path.basename(filePath);
+        const ext = path.extname(name).slice(1).toLowerCase();
+        insert.run(
+          name,
+          filePath,
+          stats.size,
+          ext || 'none',
+          Math.round(stats.mtimeMs),
+          getNamePinyin(name, null),
+          now,
+        );
+        ok++;
+      } catch {
+        fail++;
+      }
+    }
+  });
+  transaction();
+
+  return { ok, fail };
+}
+
+/**
  * 用系统程序打开文件
  */
-export function openFile(id: number): { ok: boolean; reason?: string } {
+export async function openFile(id: number): Promise<{ ok: boolean; reason?: string }> {
   const file = getFile(id);
   if (!file) return { ok: false, reason: '文件不存在' };
   if (file.pathMissing) return { ok: false, reason: '路径失效' };
 
-  const result = shell.openPath(file.path);
-  if (result) {
-    return { ok: false, reason: result };
+  const errorMessage = await shell.openPath(file.path);
+  if (errorMessage) {
+    return { ok: false, reason: errorMessage };
   }
   return { ok: true };
 }
@@ -254,6 +347,92 @@ export function revealFile(id: number): boolean {
  */
 export function getPreviewMeta(id: number): FileRow | null {
   return getFile(id);
+}
+
+/** 预览读取上限 50MB，超过则走兜底图标 */
+export const MAX_PREVIEW_BYTES = 50 * 1024 * 1024;
+
+/**
+ * 只读读取文件二进制，用于渲染进程内渲染预览
+ * 不做文本提取、不写入数据库
+ */
+export function readFileBytes(id: number): Uint8Array {
+  const file = getFile(id);
+  if (!file) throw new Error('文件不存在');
+  if (file.pathMissing) throw new Error('文件已不在原路径');
+  if (file.size > MAX_PREVIEW_BYTES) throw new Error('文件过大，无法预览');
+  return new Uint8Array(fs.readFileSync(file.path));
+}
+
+/**
+ * 获取文件的标签 / 专题 / 项目关联（只读）
+ */
+export function getFileAssociationsFrom(
+  db: ReturnType<typeof getDb>,
+  id: number,
+): FileAssociations {
+  const tags = db
+    .prepare(
+      `SELECT t.id, t.name
+       FROM tags t
+       JOIN tag_links tl ON tl.tag_id = t.id
+       WHERE tl.file_id = ?
+       ORDER BY t.name COLLATE NOCASE`,
+    )
+    .all(id) as { id: number; name: string }[];
+
+  const topics = db
+    .prepare(
+      `SELECT t.id, t.name
+       FROM resource_topics t
+       JOIN resource_topic_links l ON l.topic_id = t.id
+       WHERE l.file_id = ?
+       ORDER BY t.sort_order ASC, t.name COLLATE NOCASE`,
+    )
+    .all(id) as { id: number; name: string }[];
+
+  const projects = db
+    .prepare(
+      `SELECT p.id, p.name
+       FROM projects p
+       JOIN project_files pf ON pf.project_id = p.id
+       WHERE pf.file_id = ?
+       ORDER BY p.name COLLATE NOCASE`,
+    )
+    .all(id) as { id: number; name: string }[];
+
+  return { tags, topics, projects };
+}
+
+export function getFileAssociations(id: number): FileAssociations {
+  return getFileAssociationsFrom(getDb(), id);
+}
+
+/**
+ * 弹窗选择移动目标文件夹，并返回移动后的完整路径
+ */
+export function pickMoveTarget(id: number): MoveTargetInfo | null {
+  const file = getFile(id);
+  if (!file) throw new Error('文件不存在');
+  if (file.pathMissing) throw new Error('文件已不在原路径');
+
+  const focused = BrowserWindow.getFocusedWindow();
+  const options: Electron.OpenDialogSyncOptions = {
+    title: '选择目标文件夹',
+    buttonLabel: '移动到此处',
+    properties: ['openDirectory', 'createDirectory'],
+  };
+  const result = focused
+    ? dialog.showOpenDialogSync(focused, options)
+    : dialog.showOpenDialogSync(options);
+
+  if (!result || result.length === 0) return null;
+  const dir = result[0];
+  return {
+    dir,
+    targetPath: path.join(dir, path.basename(file.path)),
+    sourcePath: file.path,
+  };
 }
 
 /**
