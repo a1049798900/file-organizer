@@ -24,7 +24,7 @@
     "better-sqlite3": "^13.0.3",
     "clsx": "^2.1.1",
     "electron-updater": "^6.8.3",
-    "lucide-react": "^1.61.0",
+    "lucide-react": "^1.64.0",
     "mammoth": "^1.13.0",
     "pdfjs-dist": "^6.4.299",
     "pinyin-pro": "^3.29.5",
